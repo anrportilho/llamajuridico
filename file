@@ -1,0 +1,811 @@
+# -*- coding: utf-8 -*-
+r"""
+Versão do fluxo de ACÓRDÃOS usando um modelo LOCAL no Ollama (sem navegador).
+
+Fluxo:
+ 1) Carrega o CSV e remove os eventos de SENTENÇA
+ 2) Copia os arquivos para ...\ARQUIVOS\ACORDAO, extrai os .zip e renomeia
+    para {codProcesso}-{ordem}
+ 3) Extrai o texto de cada arquivo e RECORTA os trechos relevantes
+    (dispositivo, honorários, condenação, valores) para caber no contexto
+ 4) Envia ao Ollama (API local) pedindo JSON estruturado
+ 5) Popula as 4 colunas no dataframe e salva (checkpoint a cada N linhas)
+
+Instalação:
+    pip install pandas requests pdfplumber python-docx tqdm
+    ollama pull qwen3:8b
+
+Antes de rodar: o Ollama precisa estar aberto (ícone na bandeja).
+
+Paralelismo:
+ - Com uma GPU de 6 GB, o Ollama processa 1 requisição por vez de forma
+   eficiente. WORKERS=2 ainda ajuda: enquanto um worker espera o modelo,
+   o outro extrai o texto do PDF (CPU). Mais que 2 não acelera.
+ - Se quiser o Ollama atendendo 2 ao mesmo tempo, defina a variável de
+   ambiente OLLAMA_NUM_PARALLEL=2 (consome o dobro de memória de contexto).
+
+Interromper: um Ctrl+C (ou "Interrupt" do Jupyter) para os workers, grava o
+checkpoint e sai. Na próxima execução retoma das linhas sem resultado.
+
+Saída no terminal: só barras de progresso. Resultados, alertas e erros vão
+para LOG_ARQUIVO.
+"""
+import json
+import logging
+import os
+import queue
+import re
+import shutil
+import threading
+import time
+import unicodedata
+import uuid
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pandas as pd
+import requests
+from tqdm import tqdm
+
+# ----------------------------------------------------------------- CONFIG
+CSV_ENTRADA = r"E:\ARQUIVOS\llama\JUIZADO_ESPECIAL_documentos.csv"
+# Arquivo PRÓPRIO deste script (não compartilhe com o do Adapta/n8n).
+CSV_SAIDA = r"E:\ARQUIVOS\llama\JUIZADO_ESPECIAL_resultado_ollama.csv"
+LOG_ARQUIVO = r"E:\ARQUIVOS\llama\JUIZADO_ESPECIAL_resultado_ollama.log"
+
+# Resultados de OUTRAS execuções para aproveitar (só leitura). Linhas com
+# resultado nesses CSVs NÃO são reenviadas ao modelo; os arquivos já extraídos
+# (coluna arquivo_extraido) são reaproveitados.
+# Vazio por padrão: assim o Ollama processa tudo e você pode comparar com o
+# resultado do Adapta. Para só completar o que falta, descomente as linhas.
+CSVS_ANTERIORES = {
+    # "adapta": r"C:\AUTOMACAO\QGC\WELLINGTON\45k\JUIZADO_ESPECIAL_resultado_adapta.csv",
+    # "n8n": r"C:\AUTOMACAO\QGC\WELLINGTON\45k\JUIZADO_ESPECIAL_resultado.csv",
+}
+PASTA_ORIGEM = Path(r"E:\ARQUIVOS")
+PASTA_DESTINO = PASTA_ORIGEM / "ACORDAO"
+PASTA_ZIPS = PASTA_DESTINO / "_zips_originais"
+PASTA_EXTRAIDOS = PASTA_DESTINO
+
+# --- Ollama
+OLLAMA_URL = "http://localhost:11434"
+MODELO = "qwen3.5:4b"
+NUM_CTX = 8192            # janela de contexto (tokens). 8192 cabe bem em 6 GB + RAM
+NUM_PREDICT = 400         # máximo de tokens na resposta (o JSON é curto)
+TEMPERATURA = 0           # determinístico
+PENSAR = False            # modo "thinking" do qwen3 (True = mais lento, às vezes mais preciso)
+USAR_SCHEMA = True        # força o formato do JSON via schema; cai para "json" se não suportar
+KEEP_ALIVE = "30m"        # mantém o modelo carregado entre documentos
+
+LIMITE = None            # nº de linhas para teste; None = fluxo completo
+WORKERS = 2               # ver "Paralelismo" no topo
+MAX_CHARS = 12000         # texto (já recortado) enviado ao modelo. ~3.500 tokens
+JANELA_LINHAS = 2         # linhas de contexto ao redor de cada trecho relevante
+FINAL_CHARS = 4000        # sempre inclui o FIM do documento (dispositivo/certidão)
+TIMEOUT_RESPOSTA = 600    # segundos (inclui tempo esperando na fila do Ollama)
+TENTATIVAS = 3            # tentativas por documento em caso de erro de rede/API
+TOLERANCIA_HONOR = 0.02   # 2%: divergência aceita entre % x total e valor aplicado
+
+SALVAR_A_CADA = 25
+SALVAR_ARQUIVOS_A_CADA = 200
+LOG_DETALHADO = True
+
+PROMPT_SISTEMA = (
+    "Você é um analista jurídico que extrai dados de acórdãos de Turmas "
+    "Recursais dos Juizados Especiais Cíveis. Responda sempre e somente com "
+    "JSON válido. Use apenas informações presentes no texto; se algo não "
+    "estiver no texto, use null. Nunca invente valores.\n"
+    "Contexto: no Juizado (Lei 9.099/95, art. 55), o recorrente vencido é "
+    "condenado em custas e honorários advocatícios, normalmente entre 10% e "
+    "20% do valor da condenação ou, não havendo condenação, do valor "
+    "corrigido da causa. O texto pode ter trechos omitidos, marcados com [...]."
+)
+
+PROMPT_USUARIO = (
+    "Extraia do acórdão abaixo um objeto JSON com exatamente estas chaves:\n"
+    "- valor_total_condenacao: número decimal com ponto (ex.: 1234.56), soma "
+    "de todos os valores da condenação (danos morais, materiais, restituição "
+    "etc.), ou null se o texto não informar valores\n"
+    "- condenacao_honorarios: \"Sim\" se houve condenação em honorários "
+    "advocatícios, \"Não\" se o texto disser que não há, ou null se não houver "
+    "informação\n"
+    "- percentual_aplicado: percentual dos honorários (ex.: 10), ou null\n"
+    "- valor_aplicado: valor em reais dos honorários, se o texto informar "
+    "ou se for valor fixo, ou null\n"
+    "- trecho_honorarios: copie a frase do texto que trata dos honorários, "
+    "ou null\n\n"
+    "TEXTO DO ACÓRDÃO:\n"
+)
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "valor_total_condenacao": {"type": ["number", "null"]},
+        "condenacao_honorarios": {"type": ["string", "null"]},
+        "percentual_aplicado": {"type": ["number", "null"]},
+        "valor_aplicado": {"type": ["number", "null"]},
+        "trecho_honorarios": {"type": ["string", "null"]},
+    },
+    "required": ["valor_total_condenacao", "condenacao_honorarios",
+                 "percentual_aplicado", "valor_aplicado", "trecho_honorarios"],
+}
+
+# Linhas que indicam trecho relevante para o recorte
+RELEVANTE = re.compile(
+    r"honor[aá]ri|sucumb|condena|condeno|R\$|\d\s*%|por cento|art\.?\s*55|"
+    r"9\.099|provimento|ACORDAM|ac[oó]rd[aã]o|ante o exposto|isto posto|"
+    r"diante do exposto|pelo exposto|posto isso|dispositivo|danos? mora|"
+    r"danos? materia|restitui|indeniza|repeti[cç][aã]o|em dobro|custas",
+    re.IGNORECASE,
+)
+
+NOVAS_COLUNAS = [
+    "valor_total_condenacao",
+    "condenacao_honorarios",
+    "percentual_aplicado",
+    "valor_aplicado",
+]
+COLUNAS_CONTROLE = ["arquivo_extraido", "id_req", "status", "alerta", "origem"]
+CHAVE = ["codProcesso", "codDocumento"]
+INVALIDOS = ("NAO_ENCONTRADO", "VAZIO", "<NA>", "nan", "None", "")
+FALHAS = ("erro no modelo", "sem JSON", "erro")
+
+PARAR = threading.Event()
+
+logging.basicConfig(
+    filename=LOG_ARQUIVO,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+    encoding="utf-8",
+)
+log = logging.getLogger("ollama")
+
+
+# ----------------------------------------------------------------- UTIL
+def norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s))
+    return "".join(c for c in s if not unicodedata.combining(c)).upper().strip()
+
+
+def ler_csv(caminho):
+    for enc in ("utf-8-sig", "latin-1", "cp1252"):
+        try:
+            return pd.read_csv(caminho, sep=None, engine="python",
+                               encoding=enc, dtype=str,
+                               keep_default_na=False, na_values=[""])
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError("Não consegui ler o CSV (encoding).")
+
+
+def salvar_csv(df):
+    """Gravação atômica (.tmp -> replace)."""
+    tmp = CSV_SAIDA + ".tmp"
+    df.to_csv(tmp, index=False, encoding="utf-8-sig", sep=";")
+    for _ in range(10):
+        try:
+            os.replace(tmp, CSV_SAIDA)
+            return
+        except PermissionError:
+            time.sleep(1)
+    log.error(f"não consegui substituir {CSV_SAIDA} (arquivo aberto?); "
+              f"o checkpoint mais recente está em {tmp}")
+    tqdm.write(f"AVISO: {CSV_SAIDA} está aberto; checkpoint salvo em {tmp}")
+
+
+def localizar_arquivo(row) -> Path | None:
+    p = Path(str(row["arquivo"]).strip())
+    if p.exists():
+        return p
+    p2 = PASTA_ORIGEM / p.name
+    if p2.exists():
+        return p2
+    achados = list(PASTA_ORIGEM.glob(f"{row['codProcesso']}-*_{row['codDocumento']}_*"))
+    return achados[0] if achados else None
+
+
+def para_numero(v):
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if s.upper() in ("", "N/A", "NULL", "NONE"):
+        return None
+    s = re.sub(r"[^\d,.\-]", "", s)
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def normaliza_sim_nao(v):
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return "Sim" if v else "Não"
+    n = norm(v)
+    if n in ("TRUE", "YES"):
+        return "Sim"
+    if n in ("FALSE", "NO"):
+        return "Não"
+    if n.startswith("S"):
+        return "Sim"
+    if n.startswith("N") and n not in ("N/A", "NULL", "NONE"):
+        return "Não"
+    return None
+
+
+# ----------------------------------------------------------------- ARQUIVOS
+def copiar_e_extrair(origem: Path, cod_processo: str, contador: list) -> list[Path]:
+    PASTA_ZIPS.mkdir(parents=True, exist_ok=True)
+    PASTA_EXTRAIDOS.mkdir(parents=True, exist_ok=True)
+
+    copia = PASTA_ZIPS / origem.name
+    if not copia.exists():
+        shutil.copy2(origem, copia)
+
+    resultado = []
+
+    def salvar(conteudo_path: Path, ext: str):
+        contador[0] += 1
+        destino = PASTA_EXTRAIDOS / f"{cod_processo}-{contador[0]:06d}{ext}"
+        shutil.move(str(conteudo_path), destino)
+        resultado.append(destino)
+
+    if zipfile.is_zipfile(copia):
+        tmp = PASTA_DESTINO / "_tmp_extracao"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        with zipfile.ZipFile(copia) as z:
+            z.extractall(tmp)
+        for f in sorted(p for p in tmp.rglob("*") if p.is_file()):
+            salvar(f, f.suffix.lower())
+        shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        tmp_copy = PASTA_DESTINO / f"_tmp_{copia.name}"
+        shutil.copy2(copia, tmp_copy)
+        salvar(tmp_copy, copia.suffix.lower() or ".bin")
+    return resultado
+
+
+def extrair_texto(arq: Path) -> str:
+    ext = arq.suffix.lower()
+    try:
+        if ext == ".pdf":
+            import pdfplumber
+            with pdfplumber.open(arq) as pdf:
+                partes = []
+                for pg in pdf.pages:
+                    partes.append(pg.extract_text() or "")
+                    pg.flush_cache()
+                return "\n".join(partes)
+        if ext == ".docx":
+            import docx
+            return "\n".join(p.text for p in docx.Document(arq).paragraphs)
+        if ext in (".txt", ".html", ".htm", ".rtf", ".xml", ".csv"):
+            raw = arq.read_bytes()
+            txt = raw.decode("latin-1")
+            for enc in ("utf-8", "cp1252", "latin-1"):
+                try:
+                    txt = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if ext in (".html", ".htm", ".xml"):
+                txt = re.sub(r"<[^>]+>", " ", txt)
+            return txt
+    except Exception as e:
+        return f"[ERRO AO LER {arq.name}: {e}]"
+    return ""
+
+
+def recortar_texto(texto: str) -> tuple[str, bool]:
+    """Mantém só as linhas relevantes (com contexto) + o fim do documento.
+    Devolve (texto_recortado, foi_recortado)."""
+    texto = re.sub(r"[ \t]+", " ", texto)
+    texto = re.sub(r"\n{3,}", "\n\n", texto).strip()
+    if len(texto) <= MAX_CHARS:
+        return texto, False
+
+    linhas = texto.splitlines()
+    manter = set()
+    for n, linha in enumerate(linhas):
+        if RELEVANTE.search(linha):
+            manter.update(range(max(0, n - JANELA_LINHAS),
+                                min(len(linhas), n + JANELA_LINHAS + 1)))
+    acum = 0                                  # fim do documento
+    for n in range(len(linhas) - 1, -1, -1):
+        manter.add(n)
+        acum += len(linhas[n]) + 1
+        if acum >= FINAL_CHARS:
+            break
+
+    partes, anterior = [], -2
+    for n in sorted(manter):
+        if n != anterior + 1:
+            partes.append("[...]")
+        partes.append(linhas[n])
+        anterior = n
+    rec = "\n".join(partes)
+
+    if len(rec) > MAX_CHARS:                  # ainda grande: prioriza início e fim
+        meio = MAX_CHARS // 2
+        rec = rec[:meio] + "\n[...]\n" + rec[-meio:]
+    return rec, True
+
+
+# ----------------------------------------------------------------- JSON
+def extrair_json(texto: str) -> dict | None:
+    texto = (texto or "").strip()
+    try:
+        d = json.loads(texto)
+        return d if isinstance(d, dict) else None
+    except json.JSONDecodeError:
+        pass
+    texto = re.sub(r"<think>.*?</think>", "", texto, flags=re.DOTALL)
+    for m in re.finditer(r"\{[^{}]*\}", texto, re.DOTALL):
+        try:
+            d = json.loads(m.group(0))
+            if isinstance(d, dict) and "valor_total_condenacao" in d:
+                return d
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+# ----------------------------------------------------------------- OLLAMA
+class AgenteOllama:
+    """Cliente da API /api/chat do Ollama (uma sessão HTTP por worker)."""
+
+    def __init__(self, worker_id=1):
+        self.worker_id = worker_id
+        self.sessao = requests.Session()
+        self.formato = SCHEMA if USAR_SCHEMA else "json"
+        self.pensar = PENSAR
+
+    def _payload(self, texto_doc: str) -> dict:
+        p = {
+            "model": MODELO,
+            "messages": [
+                {"role": "system", "content": PROMPT_SISTEMA},
+                {"role": "user", "content": PROMPT_USUARIO + texto_doc},
+            ],
+            "stream": False,
+            "format": self.formato,
+            "keep_alive": KEEP_ALIVE,
+            "options": {
+                "temperature": TEMPERATURA,
+                "num_ctx": NUM_CTX,
+                "num_predict": NUM_PREDICT,
+            },
+        }
+        if self.pensar is not None:
+            p["think"] = self.pensar
+        return p
+
+    def perguntar(self, texto_doc: str) -> tuple[dict | None, dict]:
+        """Devolve (json_extraido | None, metricas)."""
+        ultimo_erro = None
+        for tentativa in range(1, TENTATIVAS + 1):
+            if PARAR.is_set():
+                return None, {}
+            try:
+                r = self.sessao.post(f"{OLLAMA_URL}/api/chat",
+                                     json=self._payload(texto_doc),
+                                     timeout=TIMEOUT_RESPOSTA)
+                if r.status_code >= 400:
+                    msg = r.text[:300]
+                    # versão/modelo sem suporte a "think" ou a schema: desliga e tenta de novo
+                    if self.pensar is not None and "think" in msg.lower():
+                        log.warning(f"worker {self.worker_id}: 'think' não suportado; desligando")
+                        self.pensar = None
+                        continue
+                    if self.formato != "json":
+                        log.warning(f"worker {self.worker_id}: schema recusado ({msg}); usando format=json")
+                        self.formato = "json"
+                        continue
+                    raise RuntimeError(f"HTTP {r.status_code}: {msg}")
+                data = r.json()
+                metricas = {
+                    "prompt_tokens": data.get("prompt_eval_count") or 0,
+                    "resp_tokens": data.get("eval_count") or 0,
+                    "seg": (data.get("total_duration") or 0) / 1e9,
+                    "done_reason": data.get("done_reason"),
+                }
+                return extrair_json(data.get("message", {}).get("content", "")), metricas
+            except (requests.RequestException, RuntimeError) as e:
+                ultimo_erro = e
+                log.warning(f"worker {self.worker_id}: erro na tentativa "
+                            f"{tentativa}/{TENTATIVAS}: {e}")
+                time.sleep(3 * tentativa)
+        raise RuntimeError(f"Ollama falhou após {TENTATIVAS} tentativas: {ultimo_erro}")
+
+    def fechar(self):
+        self.sessao.close()
+
+
+def verificar_ollama():
+    """Confere se o Ollama está no ar, se o modelo existe, e já o carrega."""
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Ollama não respondeu em {OLLAMA_URL}. Ele está aberto? ({e})")
+    nomes = {m["name"] for m in r.json().get("models", [])}
+    if MODELO not in nomes and f"{MODELO}:latest" not in nomes:
+        raise RuntimeError(f"Modelo '{MODELO}' não encontrado. Rode: ollama pull {MODELO}\n"
+                           f"Disponíveis: {sorted(nomes)}")
+    print(f"Carregando {MODELO} na memória...")
+    requests.post(f"{OLLAMA_URL}/api/generate",
+                  json={"model": MODELO, "keep_alive": KEEP_ALIVE}, timeout=300)
+
+
+# ----------------------------------------------------------------- VALIDAÇÃO
+def normalizar_resposta(d: dict) -> tuple[dict, str]:
+    dados = {
+        "valor_total_condenacao": para_numero(d.get("valor_total_condenacao")),
+        "condenacao_honorarios": normaliza_sim_nao(d.get("condenacao_honorarios")),
+        "percentual_aplicado": para_numero(d.get("percentual_aplicado")),
+        "valor_aplicado": para_numero(d.get("valor_aplicado")),
+    }
+    alertas = []
+    if dados["condenacao_honorarios"] is None and (
+            dados["percentual_aplicado"] or dados["valor_aplicado"]):
+        dados["condenacao_honorarios"] = "Sim"
+        alertas.append("honorarios inferido como Sim (modelo não informou)")
+    total, pct, val = (dados["valor_total_condenacao"],
+                       dados["percentual_aplicado"], dados["valor_aplicado"])
+    if dados["condenacao_honorarios"] == "Não" and (pct or val):
+        alertas.append("honorarios=Não mas há % ou valor")
+    if total and pct and val:
+        esperado = total * pct / 100
+        if esperado and abs(esperado - val) / esperado > TOLERANCIA_HONOR:
+            alertas.append(f"valor_aplicado diverge de total*% (esperado {esperado:.2f})")
+    if pct is not None and not (0 <= pct <= 100):
+        alertas.append("percentual fora de 0-100")
+    return dados, "; ".join(alertas)
+
+
+def valores_no_texto(dados: dict, texto: str) -> list[str]:
+    """Validação cruzada: valores em R$ devolvidos pelo modelo devem aparecer
+    no texto (o total pode ser soma, então só checa os valores de honorários)."""
+    alertas = []
+    val = dados.get("valor_aplicado")
+    if val:
+        alvo = _br(val)                       # ex.: 1.234,56
+        alvo_sem_milhar = alvo.replace(".", "")
+        if alvo not in texto and alvo_sem_milhar not in texto:
+            alertas.append("valor_aplicado não aparece no texto (pode ter sido calculado)")
+    return alertas
+
+
+def _br(v: float, casas: int = 2) -> str:
+    s = f"{v:,.{casas}f}"
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_moeda(v):
+    return "N/A" if v is None else f"R$ {_br(v)}"
+
+
+def fmt_pct(v):
+    if v is None:
+        return "N/A"
+    return f"{_br(v, 0)}%" if float(v).is_integer() else f"{_br(v)}%"
+
+
+def formatar_br(dados: dict) -> dict:
+    return {
+        "valor_total_condenacao": fmt_moeda(dados["valor_total_condenacao"]),
+        "condenacao_honorarios": dados["condenacao_honorarios"] or "N/A",
+        "percentual_aplicado": fmt_pct(dados["percentual_aplicado"]),
+        "valor_aplicado": fmt_moeda(dados["valor_aplicado"]),
+    }
+
+
+# ----------------------------------------------------------------- WORKERS
+_SENTINELA = None
+
+
+def _analisar(agente, i, registro) -> dict:
+    cod = registro.get("codProcesso")
+    res = {"i": i, "status": "erro", "dados": None, "id_req": None,
+           "alerta": None, "mensagem": None}
+    arqs = str(registro.get("arquivo_extraido", ""))
+    if arqs in INVALIDOS or arqs.startswith("ERRO"):
+        res.update(status="sem arquivo", dados={c: "N/A" for c in NOVAS_COLUNAS})
+        return res
+    texto = "\n\n".join(extrair_texto(Path(p)) for p in arqs.split("|"))
+    if not texto.strip():
+        res.update(status="sem texto", dados={c: "SEM_TEXTO" for c in NOVAS_COLUNAS})
+        return res
+
+    texto_env, recortado = recortar_texto(texto)
+    try:
+        resp, met = agente.perguntar(texto_env)
+    except Exception as e:
+        res.update(status="erro no modelo", mensagem=f"{cod}: erro no modelo: {e}")
+        return res
+    if resp is None:
+        res.update(status="sem JSON", mensagem=f"{cod}: sem JSON válido (reprocessa depois)")
+        return res
+
+    dados, alerta = normalizar_resposta(resp)
+    alertas = [alerta] if alerta else []
+    alertas += valores_no_texto(dados, texto)
+    if met.get("prompt_tokens", 0) >= NUM_CTX - NUM_PREDICT:
+        alertas.append("texto pode ter sido truncado pelo contexto (aumente NUM_CTX)")
+    if met.get("done_reason") == "length":
+        alertas.append("resposta cortada (aumente NUM_PREDICT)")
+    alerta = "; ".join(alertas)
+
+    dados_br = formatar_br(dados)
+    tok_s = met["resp_tokens"] / met["seg"] if met.get("seg") else 0
+    res.update(
+        status="OK", dados=dados_br, id_req=uuid.uuid4().hex[:10],
+        alerta=alerta or None,
+        mensagem=(f"{cod}: {dados_br} | trecho: {resp.get('trecho_honorarios')!r} | "
+                  f"{met['prompt_tokens']} tok entrada, {met['seg']:.1f}s, {tok_s:.1f} tok/s"
+                  + (" | recortado" if recortado else "")
+                  + (f" ALERTA: {alerta}" if alerta else "")),
+    )
+    return res
+
+
+def _worker_ia(worker_id: int, fila_tarefas, fila_resultados):
+    agente = None
+    item = None
+    try:
+        agente = AgenteOllama(worker_id=worker_id)
+        while not PARAR.is_set():
+            try:
+                item = fila_tarefas.get(timeout=1)
+            except queue.Empty:
+                item = None
+                continue
+            if item is _SENTINELA:
+                break
+            i, registro = item
+            try:
+                resultado = _analisar(agente, i, registro)
+            except Exception as e:
+                resultado = {"i": i, "status": "erro", "dados": None, "id_req": None,
+                             "alerta": None, "mensagem": f"linha {i + 1}: {e}"}
+            if PARAR.is_set() and resultado["status"] in FALHAS:
+                break
+            fila_resultados.put(resultado)
+            item = None
+    except Exception as e:
+        if item not in (None, _SENTINELA):
+            fila_tarefas.put(item)
+        fila_resultados.put({"worker_erro": f"Worker {worker_id} parou: {e}"})
+    finally:
+        if agente:
+            agente.fechar()
+
+
+# ----------------------------------------------------------------- RETOMADA
+def _ler_anterior(caminho):
+    p = Path(caminho)
+    if not p.exists() or p.stat().st_size == 0:
+        return None
+    try:
+        ant = ler_csv(p)
+    except Exception as e:
+        print(f"AVISO: não consegui ler {p.name} ({e}); ignorando.")
+        return None
+    if not set(CHAVE) <= set(ant.columns):
+        print(f"AVISO: {p.name} não tem as colunas {CHAVE}; ignorando.")
+        return None
+    for c in NOVAS_COLUNAS + COLUNAS_CONTROLE:
+        if c not in ant.columns:
+            ant[c] = pd.NA
+    return ant.drop_duplicates(subset=CHAVE, keep="last")
+
+
+def retomar(df):
+    df = df.reset_index(drop=True)
+    for c in NOVAS_COLUNAS + COLUNAS_CONTROLE:
+        df[c] = pd.NA
+    fontes = [("ollama", CSV_SAIDA)] + list(CSVS_ANTERIORES.items())
+    bloco = NOVAS_COLUNAS + ["id_req", "status", "alerta"]
+    for nome, caminho in fontes:
+        ant = _ler_anterior(caminho)
+        if ant is None:
+            continue
+        m = df[CHAVE].merge(ant[CHAVE + NOVAS_COLUNAS + COLUNAS_CONTROLE],
+                            on=CHAVE, how="left")
+        m.index = df.index
+        sem_arq = df["arquivo_extraido"].isna() & m["arquivo_extraido"].notna()
+        df.loc[sem_arq, "arquivo_extraido"] = m.loc[sem_arq, "arquivo_extraido"]
+        novo = df["valor_total_condenacao"].isna() & m["valor_total_condenacao"].notna()
+        df.loc[novo, bloco] = m.loc[novo, bloco].values
+        df.loc[novo, "origem"] = m.loc[novo, "origem"].fillna(nome).values
+        print(f"  {nome}: {novo.sum()} resultados aproveitados, "
+              f"{sem_arq.sum()} arquivos já extraídos ({Path(caminho).name})")
+    return df
+
+
+# ----------------------------------------------------------------- MAIN
+def main():
+    if not isinstance(WORKERS, int) or WORKERS < 1:
+        raise ValueError("WORKERS precisa ser um inteiro maior ou igual a 1.")
+
+    verificar_ollama()
+
+    df = ler_csv(CSV_ENTRADA)
+    tipo = df["evento"].map(lambda e: norm(e).split(" - ")[0].strip())
+    df = df[~tipo.str.startswith("SENTENCA")].copy()
+    print(f"{len(df)} linhas após filtro (sem SENTENÇA)")
+
+    if LIMITE is not None:
+        df = df.head(LIMITE).copy()
+        print(f"MODO TESTE: processando apenas {len(df)} linhas (LIMITE={LIMITE})")
+
+    df = retomar(df)
+    print(f"Detalhes por documento em: {LOG_ARQUIVO}")
+
+    contador = [0]
+
+    # 2) copiar / extrair / renomear (sequencial)
+    nao_encontrados = 0
+    try:
+        novos = 0
+        for i, row in tqdm(df.iterrows(), total=len(df), desc="Arquivos",
+                           unit="linha", dynamic_ncols=True, mininterval=0.5):
+            if PARAR.is_set():
+                break
+            arq_ant = row["arquivo_extraido"]
+            if pd.notna(arq_ant):
+                m = re.search(r"-(\d+)$", Path(str(arq_ant).split("|")[-1]).stem)
+                if m:
+                    contador[0] = max(contador[0], int(m.group(1)))
+                continue
+            origem = localizar_arquivo(row)
+            if not origem:
+                df.at[i, "arquivo_extraido"] = "NAO_ENCONTRADO"
+                nao_encontrados += 1
+                log.warning(f"[{i + 1}] arquivo não encontrado: {row['arquivo']}")
+            else:
+                try:
+                    extraidos = copiar_e_extrair(origem, str(row["codProcesso"]), contador)
+                    df.at[i, "arquivo_extraido"] = "|".join(map(str, extraidos)) or "VAZIO"
+                except Exception as e:
+                    df.at[i, "arquivo_extraido"] = f"ERRO: {e}"
+                    log.error(f"[{i + 1}] erro ao copiar/extrair {row['codProcesso']}: {e}")
+            novos += 1
+            if novos % SALVAR_ARQUIVOS_A_CADA == 0:
+                salvar_csv(df)
+    finally:
+        salvar_csv(df)
+    if nao_encontrados:
+        print(f"{nao_encontrados} arquivos não encontrados (detalhes no log)")
+    if PARAR.is_set():
+        print("Interrompido na etapa de arquivos. Checkpoint salvo.")
+        return
+
+    # 3) fila com as linhas ainda não analisadas
+    fila_tarefas = queue.Queue()
+    fila_resultados = queue.Queue()
+    pendentes = [i for i, row in df.iterrows() if pd.isna(row["valor_total_condenacao"])]
+    for i in pendentes:
+        fila_tarefas.put((i, df.loc[i].to_dict()))
+    for _ in range(WORKERS):
+        fila_tarefas.put(_SENTINELA)
+    print(f"{len(pendentes)} documentos para analisar com {MODELO} (WORKERS={WORKERS})")
+
+    cont = {"ok": 0, "sem_json": 0, "erros": 0, "alertas": 0}
+
+    def aplicar(res):
+        if "worker_erro" in res:
+            tqdm.write(res["worker_erro"])
+            log.error(res["worker_erro"])
+            return False
+        i, status = res["i"], res["status"]
+        df.at[i, "status"] = status
+        if res.get("dados") is not None:
+            df.at[i, "origem"] = "ollama"
+            for c, v in res["dados"].items():
+                df.at[i, c] = v
+            if res.get("id_req") is not None:
+                df.at[i, "id_req"] = res["id_req"]
+            if res.get("alerta"):
+                df.at[i, "alerta"] = res["alerta"]
+        if status == "OK":
+            cont["ok"] += 1
+            if res.get("alerta"):
+                cont["alertas"] += 1
+                log.warning(res["mensagem"])
+            elif LOG_DETALHADO:
+                log.info(res["mensagem"])
+        elif status == "sem JSON":
+            cont["sem_json"] += 1
+            log.warning(res["mensagem"])
+        elif status in FALHAS:
+            cont["erros"] += 1
+            log.error(res["mensagem"])
+        return True
+
+    pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="ia-worker")
+    futures = [pool.submit(_worker_ia, wid, fila_tarefas, fila_resultados)
+               for wid in range(1, WORKERS + 1)]
+    barra = tqdm(total=len(pendentes), desc=MODELO, unit="doc",
+                 dynamic_ncols=True, mininterval=0.5, smoothing=0.05)
+    recebidos = 0
+    inicio = time.time()
+    try:
+        while recebidos < len(pendentes) and not PARAR.is_set():
+            try:
+                res = fila_resultados.get(timeout=1)
+            except queue.Empty:
+                if all(f.done() for f in futures):
+                    tqdm.write("Todos os workers pararam. Encerrando (veja o log).")
+                    break
+                continue
+            if not aplicar(res):
+                continue
+            recebidos += 1
+            barra.update(1)
+            barra.set_postfix(ok=cont["ok"], sem_json=cont["sem_json"],
+                              erros=cont["erros"], alertas=cont["alertas"],
+                              refresh=False)
+            if recebidos % SALVAR_A_CADA == 0:
+                salvar_csv(df)
+    finally:
+        PARAR.set()
+        while True:
+            try:
+                aplicar(fila_resultados.get_nowait())
+            except queue.Empty:
+                break
+        barra.close()
+        salvar_csv(df)
+        print(f"Checkpoint salvo ({cont['ok']} documentos OK nesta execução).")
+        pool.shutdown(wait=True, cancel_futures=True)
+
+    seg = time.time() - inicio
+    proc = (df["status"] == "OK").sum()
+    alertas = df["alerta"].notna().sum()
+    print(f"\nConcluído: {CSV_SAIDA}")
+    print(f"  respondidas pelo modelo: {proc}/{len(df)}")
+    print(f"  sem JSON (reprocessa na próxima): {cont['sem_json']}   erros: {cont['erros']}")
+    print(f"  com alerta de consistência: {alertas}")
+    if recebidos:
+        print(f"  vazão: {recebidos / seg * 60:.1f} docs/min")
+
+
+def executar():
+    """Roda main() em thread própria: Ctrl+C/Interrupt vira parada limpa
+    (salva o checkpoint), inclusive no Jupyter."""
+    PARAR.clear()
+    erros = []
+
+    def alvo():
+        try:
+            main()
+        except BaseException as e:  # noqa
+            erros.append(e)
+
+    t = threading.Thread(target=alvo, name="main")
+    t.start()
+    try:
+        while t.is_alive():
+            t.join(0.5)
+    except KeyboardInterrupt:
+        PARAR.set()
+        print("\nInterrupção recebida: salvando o checkpoint. Aguarde...")
+        while t.is_alive():
+            try:
+                t.join(0.5)
+            except KeyboardInterrupt:
+                print("Ainda salvando, aguarde...")
+    if erros:
+        raise erros[0]
+
+
+if __name__ == "__main__":
+    executar()
